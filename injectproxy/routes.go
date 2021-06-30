@@ -14,7 +14,9 @@
 package injectproxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -24,6 +26,7 @@ import (
 
 	"github.com/efficientgo/tools/core/pkg/merrors"
 	"github.com/pkg/errors"
+	"github.com/prometheus/alertmanager/api/v2/models"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 )
@@ -131,7 +134,7 @@ func NewRoutes(upstream *url.URL, label string, opts ...Option) (*routes, error)
 		mux.Handle("/federate", r.enforceLabel(enforceMethods(r.matcher, "GET"))),
 		mux.Handle("/api/v1/query", r.enforceLabel(enforceMethods(r.query, "GET", "POST"))),
 		mux.Handle("/api/v1/query_range", r.enforceLabel(enforceMethods(r.query, "GET", "POST"))),
-		mux.Handle("/api/v1/alerts", r.enforceLabel(enforceMethods(r.passthrough, "GET"))),
+		mux.Handle("/api/v1/alerts", r.enforceLabel(enforceMethods(r.alerts, "GET", "POST"))),
 		mux.Handle("/api/v1/rules", r.enforceLabel(enforceMethods(r.passthrough, "GET"))),
 		mux.Handle("/api/v1/series", r.enforceLabel(enforceMethods(r.matcher, "GET"))),
 	)
@@ -248,6 +251,36 @@ func withLabelValue(ctx context.Context, label string) context.Context {
 
 func (r *routes) passthrough(w http.ResponseWriter, req *http.Request) {
 	r.handler.ServeHTTP(w, req)
+}
+
+func (r *routes) alerts(w http.ResponseWriter, req *http.Request) {
+	// passthrough GET
+	if req.Method == http.MethodGet {
+		r.handler.ServeHTTP(w, req)
+		return
+	}
+
+	if req.Method == http.MethodPost {
+		alerts := []*models.Alert{}
+		defer req.Body.Close()
+		if err := json.NewDecoder(req.Body).Decode(&alerts); err != nil {
+			return
+		}
+		for _, alert := range alerts {
+			alert.Labels[r.label] = mustLabelValue(req.Context())
+		}
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(&alerts); err != nil {
+			http.Error(w, fmt.Sprintf("can't encode: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		req.Body = ioutil.NopCloser(&buf)
+		req.ContentLength = int64(buf.Len())
+		req.Header["Content-Length"] = []string{fmt.Sprint(buf.Len())}
+
+		r.handler.ServeHTTP(w, req)
+	}
 }
 
 func (r *routes) query(w http.ResponseWriter, req *http.Request) {

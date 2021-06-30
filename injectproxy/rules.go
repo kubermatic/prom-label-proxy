@@ -226,7 +226,8 @@ func (r *routes) filterRules(lvalue string, resp *apiResponse) (interface{}, err
 func (r *routes) filterAlerts(lvalue string, resp *apiResponse) (interface{}, error) {
 	var data alertsData
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
-		return nil, errors.Wrap(err, "can't decode alerts data")
+		// probably POST request
+		return resp.Data, nil
 	}
 
 	filtered := []*alert{}
