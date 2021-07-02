@@ -14,7 +14,9 @@
 package injectproxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -24,6 +26,7 @@ import (
 
 	"github.com/efficientgo/tools/core/pkg/merrors"
 	"github.com/pkg/errors"
+	"github.com/prometheus/alertmanager/api/v2/models"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 )
@@ -34,17 +37,20 @@ const (
 )
 
 type routes struct {
-	upstream *url.URL
-	handler  http.Handler
-	label    string
-
-	mux       *http.ServeMux
-	modifiers map[string]func(*http.Response) error
+	upstream   *url.URL
+	handler    http.Handler
+	label      string
+	queryParam string
+	header     string
+	mux        *http.ServeMux
+	modifiers  map[string]func(*http.Response) error
 }
 
 type options struct {
 	enableLabelAPIs bool
 	pasthroughPaths []string
+	queryParam      string
+	headerName      string
 }
 
 type Option interface {
@@ -61,6 +67,22 @@ func (f optionFunc) apply(o *options) {
 func WithEnabledLabelsAPI() Option {
 	return optionFunc(func(o *options) {
 		o.enableLabelAPIs = true
+	})
+}
+
+// WithValueFromQuery fetches the label value from the query parameters
+func WithValueFromQuery(paramName string) Option {
+	return optionFunc(func(o *options) {
+		o.queryParam = paramName
+		o.headerName = ""
+	})
+}
+
+// WithValueFromHeader fetches the label value from an HTTP header
+func WithValueFromHeader(headerName string) Option {
+	return optionFunc(func(o *options) {
+		o.headerName = headerName
+		o.queryParam = ""
 	})
 }
 
@@ -122,16 +144,27 @@ func NewRoutes(upstream *url.URL, label string, opts ...Option) (*routes, error)
 		o.apply(&opt)
 	}
 
+	if opt.queryParam == "" && opt.headerName == "" {
+		// fallback to old behaviour
+		opt.queryParam = label
+	}
+
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 
-	r := &routes{upstream: upstream, handler: proxy, label: label}
+	r := &routes{
+		upstream:   upstream,
+		handler:    proxy,
+		label:      label,
+		queryParam: opt.queryParam,
+		header:     opt.headerName,
+	}
 	mux := newStrictMux()
 
 	errs := merrors.New(
 		mux.Handle("/federate", r.enforceLabel(enforceMethods(r.matcher, "GET"))),
 		mux.Handle("/api/v1/query", r.enforceLabel(enforceMethods(r.query, "GET", "POST"))),
 		mux.Handle("/api/v1/query_range", r.enforceLabel(enforceMethods(r.query, "GET", "POST"))),
-		mux.Handle("/api/v1/alerts", r.enforceLabel(enforceMethods(r.passthrough, "GET"))),
+		mux.Handle("/api/v1/alerts", r.enforceLabel(enforceMethods(r.alerts, "GET", "POST"))),
 		mux.Handle("/api/v1/rules", r.enforceLabel(enforceMethods(r.passthrough, "GET"))),
 		mux.Handle("/api/v1/series", r.enforceLabel(enforceMethods(r.matcher, "GET"))),
 	)
@@ -186,10 +219,19 @@ func NewRoutes(upstream *url.URL, label string, opts ...Option) (*routes, error)
 
 func (r *routes) enforceLabel(h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		lvalue := req.URL.Query().Get(r.label)
-		if lvalue == "" {
-			http.Error(w, fmt.Sprintf("Bad request. The %q query parameter must be provided.", r.label), http.StatusBadRequest)
-			return
+		var lvalue string
+		if r.queryParam != "" {
+			lvalue = req.URL.Query().Get(r.queryParam)
+			if lvalue == "" {
+				http.Error(w, fmt.Sprintf("Bad request. The %q query parameter must be provided.", r.queryParam), http.StatusBadRequest)
+				return
+			}
+		} else {
+			lvalue = req.Header.Get(r.header)
+			if lvalue == "" {
+				http.Error(w, fmt.Sprintf("Bad request. The Header %q must be provided.", r.header), http.StatusBadRequest)
+				return
+			}
 		}
 		req = req.WithContext(withLabelValue(req.Context(), lvalue))
 
@@ -242,12 +284,42 @@ func mustLabelValue(ctx context.Context) string {
 	return label
 }
 
-func withLabelValue(ctx context.Context, label string) context.Context {
-	return context.WithValue(ctx, keyLabel, label)
+func withLabelValue(ctx context.Context, lvalue string) context.Context {
+	return context.WithValue(ctx, keyLabel, lvalue)
 }
 
 func (r *routes) passthrough(w http.ResponseWriter, req *http.Request) {
 	r.handler.ServeHTTP(w, req)
+}
+
+func (r *routes) alerts(w http.ResponseWriter, req *http.Request) {
+	// passthrough GET
+	if req.Method == http.MethodGet {
+		r.handler.ServeHTTP(w, req)
+		return
+	}
+
+	if req.Method == http.MethodPost {
+		alerts := []*models.Alert{}
+		defer req.Body.Close()
+		if err := json.NewDecoder(req.Body).Decode(&alerts); err != nil {
+			return
+		}
+		for _, alert := range alerts {
+			alert.Labels[r.label] = mustLabelValue(req.Context())
+		}
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(&alerts); err != nil {
+			http.Error(w, fmt.Sprintf("can't encode: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		req.Body = ioutil.NopCloser(&buf)
+		req.ContentLength = int64(buf.Len())
+		req.Header["Content-Length"] = []string{fmt.Sprint(buf.Len())}
+
+		r.handler.ServeHTTP(w, req)
+	}
 }
 
 func (r *routes) query(w http.ResponseWriter, req *http.Request) {
